@@ -138,6 +138,7 @@ model User {
   @@unique([tenantId, email])
   @@index([tenantId, email])
   @@index([walletAddress])
+  @@index([deletedAt], map: "users_deleted_at_idx")
   @@map("users")
 }
 
@@ -161,6 +162,11 @@ model Payment {
   createdAt       DateTime      @default(now()) @map("created_at")
   updatedAt       DateTime      @updatedAt @map("updated_at")
   deletedAt       DateTime?     @map("deleted_at")
+  // Generated tsvector, maintained by PostgreSQL — see migration
+  // 20260923000100_fulltext_search_payments (Issue #885). Prisma has no
+  // native tsvector type, so it is modeled as Unsupported and excluded
+  // from the client; query it with raw SQL via the search service.
+  searchVector    Unsupported("tsvector")? @map("search_vector")
 
   user      User?      @relation(fields: [userId], references: [id])
   project   Project?   @relation(fields: [projectId], references: [id])
@@ -172,6 +178,7 @@ model Payment {
   @@index([txHash])
   @@index([projectId])
   @@index([providerId])
+  @@index([deletedAt], map: "payments_deleted_at_idx")
   @@map("payments")
 }
 
@@ -195,6 +202,7 @@ model Project {
 
   @@index([tenantId, createdAt])
   @@index([status])
+  @@index([deletedAt], map: "projects_deleted_at_idx")
   @@map("projects")
 }
 
@@ -215,6 +223,7 @@ model Milestone {
   payments Payment[]
 
   @@index([projectId])
+  @@index([deletedAt], map: "milestones_deleted_at_idx")
   @@map("milestones")
 }
 
@@ -239,6 +248,7 @@ model Invoice {
   @@index([tenantId, generatedAt])
   @@index([projectId])
   @@index([status])
+  @@index([deletedAt], map: "invoices_deleted_at_idx")
   @@map("invoices")
 }
 
@@ -2397,4 +2407,27 @@ model FeatureFlagAuditLog {
   @@index([flagId, createdAt])
   @@index([actor, createdAt])
   @@map("feature_flag_audit_logs")
+}
+
+// Issue #884: Implement soft delete with archive strategy
+//
+// Generic cold-storage table for soft-deleted rows that have passed their
+// retention window. Stores the full row as JSON so any soft-deletable
+// model can be archived without a dedicated table per model, and can be
+// restored by replaying the payload back into its source table.
+model ArchivedRecord {
+  id             String   @id @default(uuid())
+  modelName      String   @map("model_name")
+  recordId       String   @map("record_id")
+  tenantId       String?  @map("tenant_id")
+  payload        Json
+  deletedAt      DateTime @map("deleted_at")
+  archivedAt     DateTime @default(now()) @map("archived_at")
+  archivedReason String   @default("retention_policy") @map("archived_reason")
+
+  @@unique([modelName, recordId])
+  @@index([modelName])
+  @@index([deletedAt])
+  @@index([tenantId])
+  @@map("archived_records")
 }

@@ -56,6 +56,9 @@ import { legacyRouter } from './routes/legacy.js';
 import { splitsRouter } from './routes/splits.js';
 import { refundsRouter } from './routes/refunds.js';
 import { databaseRouter } from './routes/database.js';
+import { archiveRouter } from './routes/archive.js';
+import { searchRouter } from './routes/search.js';
+import { getPrismaReplicaClient } from './db/PrismaReplicaClient.js';
 
 dotenv.config();
 
@@ -298,6 +301,10 @@ apiV1Router.use('/exports', streamingExportRouter);
 // Performance and pool monitoring
 apiV1Router.use('/monitoring', poolMonitorRouter);
 apiV1Router.use('/database', databaseRouter);
+// Soft delete archival sweep + restore — Issue #884
+apiV1Router.use('/archive', archiveRouter);
+// Full-text search — Issue #885
+apiV1Router.use('/search', searchRouter);
 
 // Explicit URL-based mounting
 app.use('/api/v1', apiV1Router);
