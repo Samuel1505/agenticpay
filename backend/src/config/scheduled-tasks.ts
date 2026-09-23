@@ -26,6 +26,12 @@ import { runScheduledReconciliation } from '../services/payment-reconciliation/i
 import { runEscalationEvaluation } from '../jobs/escalation.job.js';
 import { runProjectArchivalSweep } from '../services/project-archival/index.js';
 import { ethers } from 'ethers';
+import {
+  runFullBackupJob,
+  runIncrementalBackupJob,
+  runBackupRetentionCleanup,
+} from '../jobs/backup.job.js';
+import { BACKUP_SCHEDULES } from '../services/backup/BackupAutomationService.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -345,6 +351,42 @@ const RAW_TASKS: (Omit<ScheduledTaskMeta, 'schedule'> & { defaultSchedule: strin
         `[compliance] Daily summary: checks score ${result.checks.overallScore}, ${result.regulatory.newUpdates} new regulatory updates, ${result.reports.count} reports`,
       );
     },
+  },
+  // ── Database Backup Automation (Issue #880) ──────────────────────────────
+  {
+    id: 'backup-full-daily',
+    name: 'Daily Full Database Backup',
+    description:
+      'Runs a full pg_dump of the primary database, compresses it, verifies the checksum, ' +
+      'and optionally uploads to S3. Creates a new restore point on success.',
+    defaultSchedule: BACKUP_SCHEDULES.FULL, // '0 2 * * *'  — 02:00 UTC daily
+    timezone: 'UTC',
+    timeoutMs: 60 * 60 * 1000, // 1 hour
+    priority: 'critical',
+    handler: runFullBackupJob,
+  },
+  {
+    id: 'backup-incremental-6h',
+    name: '6-Hour Incremental Database Backup',
+    description:
+      'Runs a data-only pg_dump on top of the latest full backup every 6 hours. ' +
+      'Appends the incremental to the active restore point for point-in-time recovery.',
+    defaultSchedule: BACKUP_SCHEDULES.INCREMENTAL, // '0 0,6,12,18 * * *'
+    timezone: 'UTC',
+    timeoutMs: 30 * 60 * 1000, // 30 minutes
+    priority: 'high',
+    handler: runIncrementalBackupJob,
+  },
+  {
+    id: 'backup-retention-cleanup',
+    name: 'Backup Retention Cleanup',
+    description:
+      'Deletes local backup files and records older than BACKUP_RETENTION_DAYS (default: 30).',
+    defaultSchedule: BACKUP_SCHEDULES.CLEANUP, // '0 4 * * 0'  — Sunday 04:00 UTC
+    timezone: 'UTC',
+    timeoutMs: 10 * 60 * 1000,
+    priority: 'low',
+    handler: runBackupRetentionCleanup,
   },
 ];
 

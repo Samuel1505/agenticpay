@@ -328,6 +328,10 @@ if (config.jobs.enabled) {
   startJobs();
 }
 
+// Start read-replica health-check polling (Issue #881).
+// Only activates when DB_READ_REPLICA_URLS is set; no-op otherwise.
+getPrismaReplicaClient().startHealthChecks();
+
 registerDefaultProcessors();
 if (config.queue.enabled) {
   messageQueue.start();
@@ -361,6 +365,13 @@ const shutdown = (signal: string) => {
       console.log('Message queue stopped.');
     } catch (err) {
       console.error('Error stopping message queue:', err);
+    }
+
+    try {
+      getPrismaReplicaClient().stopHealthChecks();
+      console.log('Replica health checks stopped.');
+    } catch (err) {
+      console.error('Error stopping replica health checks:', err);
     }
 
     console.log('Graceful shutdown complete. Exiting.');

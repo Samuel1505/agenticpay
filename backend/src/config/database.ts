@@ -870,6 +870,10 @@ export function buildReplicaUrls(): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Returns true for queries that are safe to run on a read replica.
+ * Matches SELECT statements and CTEs (WITH …).
+ */
 export function isReadQuery(sql: string): boolean {
   return /^\s*(SELECT|WITH\s)/i.test(sql);
 }
@@ -881,7 +885,12 @@ export interface ReadReplicaTarget {
   health: ReplicaHealth;
   lagMs: number;
   lastCheckedAt: number;
+  /** Consecutive health-check failures since last healthy state. */
   failureCount: number;
+  /** True when explicitly disabled by an operator. */
+  disabled: boolean;
+  /** Epoch ms when the replica entered failover cooldown (0 = not in cooldown). */
+  cooldownUntil: number;
 }
 
 export interface ReplicaSelection {
@@ -890,62 +899,258 @@ export interface ReplicaSelection {
   reason: "write_query" | "no_replicas" | "healthy_replica" | "replica_unavailable";
 }
 
+export interface ReadReplicaRouterOptions {
+  /** Reject replicas with lag > this value. Default: DB_REPLICA_MAX_LAG_MS or 5000. */
+  maxLagMs?: number;
+  /** How often (ms) to fire background health checks. Default: DB_REPLICA_HEALTH_CHECK_INTERVAL_MS or 30 000. */
+  healthCheckIntervalMs?: number;
+  /** How long (ms) a failed replica stays in cooldown before re-admission. Default: DB_REPLICA_FAILOVER_COOLDOWN_MS or 15 000. */
+  failoverCooldownMs?: number;
+  /** Enable session-stickiness: once a session reads from a replica, pin it there. */
+  enableStickiness?: boolean;
+  /**
+   * Optional async function that checks a replica URL and returns its
+   * replication lag in milliseconds.  If it throws, the replica is marked
+   * unhealthy.  Defaults to a no-op that always returns 0 (useful in tests;
+   * in production wire a real pg query).
+   */
+  lagProbe?: (url: string) => Promise<number>;
+}
+
+/**
+ * ReadReplicaRouter — Issue #881
+ *
+ * Lightweight, dependency-free router that:
+ *  - classifies SQL as read vs write
+ *  - round-robins across healthy replicas for reads
+ *  - fails over to primary when all replicas are unavailable or lagging
+ *  - polls replica lag on a configurable interval in the background
+ *  - enforces a failover cooldown before re-admitting a flapping replica
+ *  - supports per-session stickiness (once a session picks a replica, it
+ *    stays on that replica until the replica becomes unhealthy)
+ *  - lets operators disable/enable individual replicas at runtime
+ */
 export class ReadReplicaRouter {
   private replicas: ReadReplicaTarget[];
   private nextReplicaIndex = 0;
 
+  private readonly maxLagMs: number;
+  private readonly healthCheckIntervalMs: number;
+  private readonly failoverCooldownMs: number;
+  private readonly enableStickiness: boolean;
+  private readonly lagProbe: (url: string) => Promise<number>;
+
+  /** sessionId → replica URL */
+  private readonly stickyMap = new Map<string, string>();
+
+  private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor(
-    replicaUrls = buildReplicaUrls(),
-    private readonly primaryUrl = process.env.DATABASE_URL ?? "",
-    private readonly maxLagMs = envInt("DB_REPLICA_MAX_LAG_MS", 5000),
+    replicaUrls: string[] = buildReplicaUrls(),
+    readonly primaryUrl: string = process.env.DATABASE_URL ?? "",
+    maxLagMs?: number,
+    options: ReadReplicaRouterOptions = {},
   ) {
+    // Accept the legacy positional-third-arg signature used in existing tests,
+    // but also support the new options bag.
+    this.maxLagMs = maxLagMs
+      ?? options.maxLagMs
+      ?? envInt("DB_REPLICA_MAX_LAG_MS", 5000);
+
+    this.healthCheckIntervalMs =
+      options.healthCheckIntervalMs
+      ?? envInt("DB_REPLICA_HEALTH_CHECK_INTERVAL_MS", 30_000);
+
+    this.failoverCooldownMs =
+      options.failoverCooldownMs
+      ?? envInt("DB_REPLICA_FAILOVER_COOLDOWN_MS", 15_000);
+
+    this.enableStickiness = options.enableStickiness ?? true;
+
+    // Default probe: always healthy (0 ms lag).  In production, inject a
+    // real pg probe via PrismaReplicaClient.startHealthChecks().
+    this.lagProbe = options.lagProbe ?? (() => Promise.resolve(0));
+
     this.replicas = replicaUrls.map((url) => ({
       url,
-      health: "healthy",
+      health: "healthy" as ReplicaHealth,
       lagMs: 0,
       lastCheckedAt: 0,
       failureCount: 0,
+      disabled: false,
+      cooldownUntil: 0,
     }));
   }
 
-  select(sql: string): ReplicaSelection {
+  // ── Query routing ───────────────────────────────────────────────────────────
+
+  /**
+   * Choose the target URL for a given SQL statement.
+   *
+   * @param sql     The raw SQL (or Prisma action name if using Prisma middleware).
+   * @param sessionId  Optional session identifier for stickiness.
+   */
+  select(sql: string, sessionId?: string): ReplicaSelection {
     if (!isReadQuery(sql)) {
       return { url: this.primaryUrl, source: "primary", reason: "write_query" };
     }
-
-    const healthyReplicas = this.replicas.filter(
-      (replica) => replica.health === "healthy" && replica.lagMs <= this.maxLagMs,
-    );
 
     if (this.replicas.length === 0) {
       return { url: this.primaryUrl, source: "primary", reason: "no_replicas" };
     }
 
-    if (healthyReplicas.length === 0) {
+    // Session stickiness: if this session already pinned a healthy replica, reuse it.
+    if (sessionId && this.enableStickiness) {
+      const pinned = this.stickyMap.get(sessionId);
+      if (pinned) {
+        const target = this.replicas.find((r) => r.url === pinned);
+        if (target && this.isEligible(target)) {
+          return { url: pinned, source: "replica", reason: "healthy_replica" };
+        }
+        // Pinned replica is no longer healthy — release the sticky binding.
+        this.stickyMap.delete(sessionId);
+      }
+    }
+
+    const eligible = this.replicas.filter((r) => this.isEligible(r));
+
+    if (eligible.length === 0) {
       return { url: this.primaryUrl, source: "primary", reason: "replica_unavailable" };
     }
 
-    const replica = healthyReplicas[this.nextReplicaIndex % healthyReplicas.length];
-    this.nextReplicaIndex = (this.nextReplicaIndex + 1) % healthyReplicas.length;
+    // Round-robin across eligible replicas.
+    const replica = eligible[this.nextReplicaIndex % eligible.length]!;
+    this.nextReplicaIndex = (this.nextReplicaIndex + 1) % eligible.length;
+
+    if (sessionId && this.enableStickiness) {
+      this.stickyMap.set(sessionId, replica.url);
+    }
+
     return { url: replica.url, source: "replica", reason: "healthy_replica" };
   }
 
-  updateHealth(url: string, params: { healthy: boolean; lagMs?: number; checkedAt?: number }): void {
-    const replica = this.replicas.find((candidate) => candidate.url === url);
+  // ── Health management ───────────────────────────────────────────────────────
+
+  /**
+   * Apply a health update from an external caller (e.g. the Prisma middleware
+   * after a failed query, or a dedicated health-check job).
+   */
+  updateHealth(
+    url: string,
+    params: { healthy: boolean; lagMs?: number; checkedAt?: number },
+  ): void {
+    const replica = this.replicas.find((r) => r.url === url);
     if (!replica) return;
 
     replica.lagMs = params.lagMs ?? replica.lagMs;
     replica.lastCheckedAt = params.checkedAt ?? Date.now();
-    replica.health = !params.healthy
-      ? "unhealthy"
-      : replica.lagMs > this.maxLagMs
-        ? "lagging"
-        : "healthy";
-    replica.failureCount = replica.health === "healthy" ? 0 : replica.failureCount + 1;
+
+    if (!params.healthy) {
+      replica.health = "unhealthy";
+      replica.failureCount += 1;
+      // Enter failover cooldown on first failure.
+      if (replica.cooldownUntil === 0) {
+        replica.cooldownUntil = Date.now() + this.failoverCooldownMs;
+      }
+    } else if (replica.lagMs > this.maxLagMs) {
+      replica.health = "lagging";
+      replica.failureCount += 1;
+    } else {
+      replica.health = "healthy";
+      replica.failureCount = 0;
+      replica.cooldownUntil = 0;
+    }
   }
 
+  /** Administratively disable a replica (excludes it from routing). */
+  disableReplica(url: string): void {
+    const replica = this.replicas.find((r) => r.url === url);
+    if (replica) {
+      replica.disabled = true;
+    }
+  }
+
+  /** Re-enable a previously disabled replica. */
+  enableReplica(url: string): void {
+    const replica = this.replicas.find((r) => r.url === url);
+    if (replica) {
+      replica.disabled = false;
+      replica.failureCount = 0;
+      replica.cooldownUntil = 0;
+    }
+  }
+
+  // ── Background health checks ────────────────────────────────────────────────
+
+  /**
+   * Start the background polling loop.  Safe to call multiple times — only
+   * one timer is ever active.
+   */
+  startHealthChecks(): void {
+    if (this.healthCheckTimer !== null) return;
+    if (this.replicas.length === 0) return;
+
+    this.healthCheckTimer = setInterval(() => {
+      void this.runHealthCheckCycle();
+    }, this.healthCheckIntervalMs);
+
+    // Don't keep the Node.js process alive solely for health checks.
+    if (typeof this.healthCheckTimer === "object" && this.healthCheckTimer !== null) {
+      (this.healthCheckTimer as NodeJS.Timeout).unref?.();
+    }
+  }
+
+  /** Stop the background polling loop (call during graceful shutdown). */
+  stopHealthChecks(): void {
+    if (this.healthCheckTimer !== null) {
+      clearInterval(this.healthCheckTimer);
+      this.healthCheckTimer = null;
+    }
+  }
+
+  /** Run one round of health checks across all replicas. Exposed for testing. */
+  async runHealthCheckCycle(): Promise<void> {
+    const now = Date.now();
+
+    await Promise.allSettled(
+      this.replicas.map(async (replica) => {
+        // Lift cooldown once the window has passed.
+        if (replica.cooldownUntil > 0 && now >= replica.cooldownUntil) {
+          replica.cooldownUntil = 0;
+        }
+
+        if (replica.disabled) return;
+
+        try {
+          const lagMs = await this.lagProbe(replica.url);
+          // Pass healthy=true so that updateHealth can decide whether the
+          // replica is "healthy" or "lagging" based on the lagMs value.
+          this.updateHealth(replica.url, { healthy: true, lagMs, checkedAt: now });
+        } catch {
+          this.updateHealth(replica.url, { healthy: false, checkedAt: now });
+        }
+      }),
+    );
+  }
+
+  // ── Observation ─────────────────────────────────────────────────────────────
+
+  /** Return a copy of the current replica state (safe to serialise). */
   snapshot(): ReadReplicaTarget[] {
-    return this.replicas.map((replica) => ({ ...replica }));
+    return this.replicas.map((r) => ({ ...r }));
+  }
+
+  /** Number of sessions currently pinned to a specific replica. */
+  stickySessions(): Map<string, string> {
+    return new Map(this.stickyMap);
+  }
+
+  // ── Private helpers ─────────────────────────────────────────────────────────
+
+  private isEligible(r: ReadReplicaTarget): boolean {
+    if (r.disabled) return false;
+    if (Date.now() < r.cooldownUntil) return false;
+    return r.health === "healthy";
   }
 }
 
