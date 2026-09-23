@@ -3,6 +3,7 @@
 
 import { PrismaClient } from '@prisma/client';
 import { SLOW_QUERY_THRESHOLD_MS, VERY_SLOW_QUERY_THRESHOLD_MS } from '../config/database.js';
+import { createPrismaQueryListener } from '../middleware/queryLogger.js';
 import { withTenantIsolationGuard } from '../security/tenant-isolation/guard.js';
 import { withEncryptionMiddleware } from '../encryption/index.js';
 
@@ -33,6 +34,7 @@ export const prisma = withEncryptionMiddleware(withTenantIsolationGuard(basePris
     console.warn(`[db] 🟡 SLOW query ${e.duration}ms: ${e.query.slice(0, 120)}…`);
   }
 });
+(basePrismaClient.$on as Function)('query', createPrismaQueryListener());
 
 if (process.env.NODE_ENV !== 'production') {
   globalForPrisma.prisma = basePrismaClient;

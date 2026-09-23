@@ -55,6 +55,7 @@ import { poolMonitorRouter } from './routes/pool-monitor.js';
 import { legacyRouter } from './routes/legacy.js';
 import { splitsRouter } from './routes/splits.js';
 import { refundsRouter } from './routes/refunds.js';
+import { databaseRouter } from './routes/database.js';
 
 dotenv.config();
 
@@ -296,6 +297,7 @@ apiV1Router.use('/payment-strategies', paymentStrategiesRouter);
 apiV1Router.use('/exports', streamingExportRouter);
 // Performance and pool monitoring
 apiV1Router.use('/monitoring', poolMonitorRouter);
+apiV1Router.use('/database', databaseRouter);
 
 // Explicit URL-based mounting
 app.use('/api/v1', apiV1Router);

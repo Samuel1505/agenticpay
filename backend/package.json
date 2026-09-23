@@ -9,6 +9,8 @@
     "start": "node dist/index.js",
     "lint": "eslint src/",
     "test": "vitest run --passWithNoTests",
+    "test:integration": "vitest run src/tests/integration --passWithNoTests",
+    "test:mutation": "stryker run",
     "test:watch": "vitest --passWithNoTests",
     "tenant-isolation:scan": "tsx src/security/tenant-isolation/scan.ts",
     "tenant-isolation:test": "vitest run src/security/tenant-isolation",
@@ -110,6 +112,8 @@
     "typescript": "^5.6.0",
     "typescript-eslint": "^8.0.0",
     "vitest": "^4.1.1"
+    ,"@stryker-mutator/core": "^9.4.0"
+    ,"@stryker-mutator/vitest-runner": "^9.4.0"
   },
   "optionalDependencies": {
     "@rollup/rollup-linux-x64-gnu": "^4.62.2"
